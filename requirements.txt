@@ -1,0 +1,9 @@
+numpy
+matplotlib
+scikit-learn
+langchain
+sentence-transformers
+nltk
+rouge-score
+transformers
+seaborn
