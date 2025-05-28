@@ -7,45 +7,52 @@ warnings.filterwarnings(
 
 import streamlit as st
 import os
-import fitz  # PyMuPDF
+import fitz
 import faiss
 import pickle
 import textwrap
 from sentence_transformers import SentenceTransformer
 from autogen import ConversableAgent
+import argostranslate.translate
 
-# LLM Config: Mistral via Ollama
+storage_dir = "pdf_data"
+os.makedirs(storage_dir, exist_ok=True)
+
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+@st.cache_resource
+def load_translation_languages():
+    return argostranslate.translate.get_installed_languages()
+
+@st.cache_data
+def load_pdf_text(pdf_path):
+    try:
+        doc = fitz.open(pdf_path)
+        return [(page_num + 1, page.get_text()) for page_num, page in enumerate(doc)]
+    except Exception as e:
+        st.error(f"Failed to read PDF {pdf_path}: {e}")
+        return []
+
+def offline_translate_to_hindi(text: str) -> str:
+    installed_languages = load_translation_languages()
+    from_lang = next(filter(lambda x: x.code == "en", installed_languages), None)
+    to_lang = next(filter(lambda x: x.code == "hi", installed_languages), None)
+    if from_lang is None or to_lang is None:
+        return "Hindi translation model not installed."
+    translation = from_lang.get_translation(to_lang)
+    return translation.translate(text)
+
 llm_config = {
     "model": "mistral:latest",
     "base_url": "http://localhost:11434",
     "api_type": "ollama"
 }
 
-# Directory to store FAISS index and chunked text
-storage_dir = "pdf_data"
-os.makedirs(storage_dir, exist_ok=True)
-
-
-class PDFAgent:
-    def __init__(self, pdf_path):
-        self.pdf_path = pdf_path
-
-    def extract_text_by_page(self):
-        try:
-            doc = fitz.open(self.pdf_path)
-            pages = [(page_num + 1, page.get_text()) for page_num, page in enumerate(doc)]
-            return pages
-        except Exception as e:
-            print(f"[!] Failed to read PDF {self.pdf_path}: {e}")
-            return []
-
-
 class EmbeddingAgent:
     def __init__(self, pdf_name):
-        try:
-            self.emb_model = SentenceTransformer("all-MiniLM-L6-v2")
-        except Exception as e:
-            print("[!] Failed to load embedding model:", e)
+        self.emb_model = load_embedding_model()
         self.pdf_name = pdf_name
 
     def chunk_text(self, pages, chunk_size=200):
@@ -69,17 +76,16 @@ class EmbeddingAgent:
         with open(f"{base}.pkl", "wb") as f:
             pickle.dump(chunks, f)
 
-
 def store_pdf_embedding(pdf_path):
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
     base = os.path.join(storage_dir, pdf_name)
 
     if os.path.exists(f"{base}.index") and os.path.exists(f"{base}.pkl"):
-        print(f"[✓] Already exists: {pdf_name}")
+        st.info(f"Embeddings for '{pdf_name}' already exist. Skipping processing.")
         return
 
-    print(f"[*] Processing {pdf_name}...")
-    text = PDFAgent(pdf_path).extract_text_by_page()
+    st.info(f"Processing {pdf_name} embeddings...")
+    text = load_pdf_text(pdf_path)
     if not text:
         return
 
@@ -87,36 +93,43 @@ def store_pdf_embedding(pdf_path):
     chunks = embedding_agent.chunk_text(text)
     index, _ = embedding_agent.build_index(chunks)
     embedding_agent.store(index, chunks)
-    print(f"[✓] Stored: {pdf_name}")
-
+    st.success(f"Stored embeddings for '{pdf_name}'.")
 
 class QueryAgent:
     def __init__(self):
-        try:
-            self.emb_model = SentenceTransformer("all-MiniLM-L6-v2")
-        except Exception as e:
-            print("[!] Failed to load embedding model:", e)
+        self.emb_model = load_embedding_model()
+        self.indices = {}
+        self.chunks = {}
+        self._load_all_embeddings()
 
-    def search_all(self, query, top_k=3):
-        query_vec = self.emb_model.encode([query])
-        results = []
+    def _load_all_embeddings(self):
         for file in os.listdir(storage_dir):
             if file.endswith(".index"):
                 pdf_name = file.replace(".index", "")
                 try:
-                    index = faiss.read_index(os.path.join(storage_dir, file))
-                    with open(os.path.join(storage_dir, f"{pdf_name}.pkl"), "rb") as f:
-                        chunks = pickle.load(f)
-                    D, I = index.search(query_vec, top_k)
-                    for dist, idx in zip(D[0], I[0]):
-                        if idx < len(chunks):
-                            page_num, chunk = chunks[idx]
-                            results.append((pdf_name, page_num, chunk, dist))
+                    index_path = os.path.join(storage_dir, file)
+                    pkl_path = os.path.join(storage_dir, f"{pdf_name}.pkl")
+                    if pdf_name not in self.indices:
+                        index = faiss.read_index(index_path)
+                        with open(pkl_path, "rb") as f:
+                            chunks = pickle.load(f)
+                        self.indices[pdf_name] = index
+                        self.chunks[pdf_name] = chunks
                 except Exception as e:
-                    print(f"[!] Error reading {pdf_name}: {e}")
-        results.sort(key=lambda x: x[3])
-        return results[:top_k]
+                    st.error(f"Error loading embeddings for '{pdf_name}': {e}")
 
+    def search_all(self, query, top_k=3):
+        query_vec = self.emb_model.encode([query])
+        results = []
+        for pdf_name, index in self.indices.items():
+            chunks = self.chunks.get(pdf_name, [])
+            D, I = index.search(query_vec, top_k)
+            for dist, idx in zip(D[0], I[0]):
+                if idx < len(chunks):
+                    page_num, chunk = chunks[idx]
+                    results.append((pdf_name, page_num, chunk, dist))
+        results.sort(key=lambda x: x[3])  # sort by distance
+        return results[:top_k]
 
 def generate_final_answer(query, retrieved_contexts):
     llm_agent = ConversableAgent(
@@ -145,145 +158,65 @@ def generate_final_answer(query, retrieved_contexts):
     )
 
     reply = llm_agent.generate_reply(messages=[{"role": "user", "name": "UserInput", "content": prompt}])
-    return reply.get("content", "No response.")
-
+    english_answer = reply.get("content", "No response.")
+    return english_answer
 
 def main():
-    st.set_page_config(page_title="📚 Divyansh LLM", layout="wide")
+    st.set_page_config(page_title="LLM PDF Q&A with Hindi Translation", layout="wide")
+    st.title("📚 LLM PDF Q&A with Hindi Translation")
 
-    # Custom CSS for styling
-    st.markdown(
-        """
-        <style>
-        /* Main container */
-        .stApp {
-            background-color: #1e1e2f;
-            color: #e0e0e0;
-            font-family: 'Segoe UI', sans-serif;
-        }
+    stored_pdfs = [f for f in os.listdir(storage_dir) if f.endswith(".pkl")]
+    st.info(f"📂 Total PDFs in database: {len(stored_pdfs)}")
 
-        /* Title */
-        h1 {
-            color: #ffffff;
-            text-shadow: 1px 1px 2px #000;
-        }
+    if stored_pdfs:
+        pdf_names = [os.path.splitext(name)[0] for name in stored_pdfs]
+        st.markdown("### 📄 Stored PDF files:")
+        for name in pdf_names:
+            st.markdown(f"- {name}")
 
-        /* Sidebar */
-        .css-1d391kg {
-            background-color: #262730 !important;
-            color: white;
-            border-right: 2px solid #444;
-        }
+    uploaded_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
 
-        /* Text input */
-        .stTextInput>div>div>input {
-            background-color: #333 !important;
-            color: white !important;
-            border-radius: 5px;
-        }
-
-        /* Buttons */
-        .stButton>button {
-            background-color: #4CAF50;
-            color: white;
-            font-weight: bold;
-            border-radius: 8px;
-            padding: 8px 16px;
-        }
-
-        /* Markdown and text */
-        .stMarkdown, .stDataFrame, .stText, .stSubheader {
-            font-size: 16px;
-            line-height: 1.6;
-        }
-
-        /* Chunk card */
-        .chunk-card {
-            background-color: #202235;
-            border: 1px solid #444;
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 10px;
-            color: #e0e0e0;
-        }
-
-        .chunk-title {
-            color: #f9c74f;
-            font-weight: 600;
-        }
-
-        /* Final answer */
-        .final-answer {
-            background-color: #1b263b;
-            border-left: 5px solid #4CAF50;
-            padding: 16px;
-            border-radius: 6px;
-            color: white;
-            font-size: 17px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.title("📚 Divyansh LLM")
-    st.write("Ask questions based on the uploaded PDFs.")
-
-    uploaded_files = st.sidebar.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
     if uploaded_files:
         for uploaded_file in uploaded_files:
             pdf_path = os.path.join(storage_dir, uploaded_file.name)
             if not os.path.exists(pdf_path):
                 with open(pdf_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                st.sidebar.success(f"Saved {uploaded_file.name}")
-                # Process embedding for new PDF
-                store_pdf_embedding(pdf_path)
-            else:
-                st.sidebar.info(f"{uploaded_file.name} already processed")
+                st.success(f"Saved {uploaded_file.name}")
+            store_pdf_embedding(pdf_path)
 
-    # Show loaded PDFs
-    pdf_files = [f for f in os.listdir(storage_dir) if f.endswith(".pdf")]
-    st.sidebar.markdown(f"**Loaded PDFs:** {', '.join(pdf_files) if pdf_files else 'None'}")
+    query = st.text_input("Ask a question about the PDFs content:")
+    if query:
+        with st.spinner("Retrieving relevant chunks and generating answer..."):
+            qa_agent = QueryAgent()
+            results = qa_agent.search_all(query)
 
-    # Initialize QueryAgent once in session state
-    if "agent" not in st.session_state:
-        st.session_state.agent = QueryAgent()
+            if results:
+                st.subheader("Relevant PDF chunks:")
+                for pdf_name, page_num, chunk, dist in results:
+                    st.markdown(f"**From {pdf_name} (Page {page_num}):**")
+                    st.write(chunk)
 
-    # User question input
-    user_query = st.text_input("📝 Your Question:")
+                english_answer = generate_final_answer(query, results)
 
-    if user_query:
-        with st.spinner("🔎 Searching for relevant info..."):
-            context = st.session_state.agent.search_all(user_query)
-
-        if not context:
-            st.warning("⚠️ No relevant info found in the PDFs.")
-        else:
-            st.subheader("📄 Retrieved PDF Chunks:")
-            for pdf, page, chunk, dist in context:
+                st.subheader("Answer (English):")
                 st.markdown(
-                    f"""
-                    <div class="chunk-card">
-                        <div class="chunk-title">📘 {pdf} — Page {page}</div>
-                        <div>{chunk[:300]}...</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
+                    f"<div style='background-color:#1b263b; border-left:5px solid #4CAF50; padding:10px; margin-top:20px; color:white;'>{english_answer}</div>",
+                    unsafe_allow_html=True,
                 )
 
-            with st.spinner("💬 Generating answer..."):
-                answer = generate_final_answer(user_query, context)
-            st.subheader("💡 Final Answer:")
-            st.markdown(
-                f"""
-                <div class="final-answer">
-                    {answer}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
+                if st.button("🔁 Translate to Hindi"):
+                    with st.spinner("Translating to Hindi..."):
+                        hindi_answer = offline_translate_to_hindi(english_answer)
+                        st.subheader("Answer (Hindi - Offline Translation):")
+                        st.markdown(
+                            f"<div style='background-color:#1b263b; border-left:5px solid #4CAF50; padding:10px; margin-top:20px; color:white;'>{hindi_answer}</div>",
+                            unsafe_allow_html=True,
+                        )
+            else:
+                st.warning("No relevant content found in uploaded PDFs.")
+    else:
+        st.info("Please upload one or more PDF files and ask a question to get started.")
 
 if __name__ == "__main__":
     main()

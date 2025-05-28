@@ -1,14 +1,19 @@
 import warnings
-warnings.filterwarnings("ignore", message=r'Field "model_client_cls" in .* has conflict with protected namespace "model_".*', category=UserWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=r'Field "model_client_cls" in .* has conflict with protected namespace "model_".*',
+    category=UserWarning,
+)
 
+import streamlit as st
 import os
-import fitz
+import fitz  
 import faiss
 import pickle
 import textwrap
 from sentence_transformers import SentenceTransformer
 from autogen import ConversableAgent
-from transformers import MarianMTModel, MarianTokenizer
+
 
 llm_config = {
     "model": "mistral:latest",
@@ -16,8 +21,10 @@ llm_config = {
     "api_type": "ollama"
 }
 
+
 storage_dir = "pdf_data"
 os.makedirs(storage_dir, exist_ok=True)
+
 
 class PDFAgent:
     def __init__(self, pdf_path):
@@ -31,6 +38,7 @@ class PDFAgent:
         except Exception as e:
             print(f"[!] Failed to read PDF {self.pdf_path}: {e}")
             return []
+
 
 class EmbeddingAgent:
     def __init__(self, pdf_name):
@@ -61,6 +69,7 @@ class EmbeddingAgent:
         with open(f"{base}.pkl", "wb") as f:
             pickle.dump(chunks, f)
 
+
 def store_pdf_embedding(pdf_path):
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
     base = os.path.join(storage_dir, pdf_name)
@@ -79,6 +88,7 @@ def store_pdf_embedding(pdf_path):
     index, _ = embedding_agent.build_index(chunks)
     embedding_agent.store(index, chunks)
     print(f"[✓] Stored: {pdf_name}")
+
 
 class QueryAgent:
     def __init__(self):
@@ -107,22 +117,6 @@ class QueryAgent:
         results.sort(key=lambda x: x[3])
         return results[:top_k]
 
-class Translator:
-    def __init__(self):
-        self.tokenizer_hi = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-hi")
-        self.model_hi = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-hi")
-        self.tokenizer_kn = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-mul")
-        self.model_kn = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-mul")
-
-    def translate_to_hindi(self, text):
-        tokens = self.tokenizer_hi.prepare_seq2seq_batch([text], return_tensors="pt", padding=True)
-        translated = self.model_hi.generate(**tokens)
-        return self.tokenizer_hi.batch_decode(translated, skip_special_tokens=True)[0]
-
-    def translate_to_kannada(self, text):
-        tokens = self.tokenizer_kn.prepare_seq2seq_batch([text], return_tensors="pt", padding=True)
-        translated = self.model_kn.generate(**tokens)
-        return self.tokenizer_kn.batch_decode(translated, skip_special_tokens=True)[0]
 
 def generate_final_answer(query, retrieved_contexts):
     llm_agent = ConversableAgent(
@@ -146,39 +140,145 @@ def generate_final_answer(query, retrieved_contexts):
         "Please do the following:\n"
         "1. Answer the question using only the content from the PDFs above.\n"
         "2. Then, extend your answer by including any general knowledge, real-world information, or technical details you know, "
-        "even if not found in the PDFs.\n\n"
+        "even if not found in the PDFs in details.\n\n"
         "Clearly label the two parts of your answer."
     )
 
     reply = llm_agent.generate_reply(messages=[{"role": "user", "name": "UserInput", "content": prompt}])
     return reply.get("content", "No response.")
 
-if __name__ == "__main__":
-    pdf_list = ["genai-principles.pdf", "LLM.pdf", "researchpaper4.pdf"]
-    for pdf_file in pdf_list:
-        store_pdf_embedding(pdf_file)
 
-    agent = QueryAgent()
-    translator = Translator()
+def main():
+    st.set_page_config(page_title="📚 Divyansh LLM", layout="wide")
 
-    print("\nPDF QA System Ready. Ask questions based on the uploaded PDFs.")
-    print("Type 'exit' to quit.\n")
+    st.markdown(
+        """
+        <style>
+        /* Main container */
+        .stApp {
+            background-color: #1e1e2f;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', sans-serif;
+        }
 
-    while True:
-        user_query = input("Your Question: ").strip()
-        if user_query.lower() in ["exit", "quit"]:
-            print("Exiting.")
-            break
+        /* Title */
+        h1 {
+            color: #ffffff;
+            text-shadow: 1px 1px 2px #000;
+        }
 
-        context = agent.search_all(user_query)
+        /* Sidebar */
+        .css-1d391kg {
+            background-color: #262730 !important;
+            color: white;
+            border-right: 2px solid #444;
+        }
+
+        /* Text input */
+        .stTextInput>div>div>input {
+            background-color: #333 !important;
+            color: white !important;
+            border-radius: 5px;
+        }
+
+        /* Buttons */
+        .stButton>button {
+            background-color: #4CAF50;
+            color: white;
+            font-weight: bold;
+            border-radius: 8px;
+            padding: 8px 16px;
+        }
+
+        /* Markdown and text */
+        .stMarkdown, .stDataFrame, .stText, .stSubheader {
+            font-size: 16px;
+            line-height: 1.6;
+        }
+
+        /* Chunk card */
+        .chunk-card {
+            background-color: #202235;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 10px;
+            color: #e0e0e0;
+        }
+
+        .chunk-title {
+            color: #f9c74f;
+            font-weight: 600;
+        }
+
+        /* Final answer */
+        .final-answer {
+            background-color: #1b263b;
+            border-left: 5px solid #4CAF50;
+            padding: 16px;
+            border-radius: 6px;
+            color: white;
+            font-size: 17px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.title("A Retrieval-Augmented Generation-Based Secure Local LLM Assistant")
+    st.write("Ask questions based on the uploaded PDFs.")
+
+    uploaded_files = st.sidebar.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            pdf_path = os.path.join(storage_dir, uploaded_file.name)
+            if not os.path.exists(pdf_path):
+                with open(pdf_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                st.sidebar.success(f"Saved {uploaded_file.name}")
+                store_pdf_embedding(pdf_path)
+            else:
+                st.sidebar.info(f"{uploaded_file.name} already processed")
+
+    pdf_files = [f for f in os.listdir(storage_dir) if f.endswith(".pdf")]
+    st.sidebar.markdown(f"**Loaded PDFs:** {', '.join(pdf_files) if pdf_files else 'None'}")
+
+    if "agent" not in st.session_state:
+        st.session_state.agent = QueryAgent()
+
+    user_query = st.text_input("📝 Your Question:")
+
+    if user_query:
+        with st.spinner("🔎 Searching for relevant info..."):
+            context = st.session_state.agent.search_all(user_query)
+
         if not context:
-            print("No relevant context found in the PDFs.")
-            continue
+            st.warning("⚠️ No relevant info found in the PDFs.")
+        else:
+            st.subheader("📄 Retrieved PDF Chunks:")
+            for pdf, page, chunk, dist in context:
+                st.markdown(
+                    f"""
+                    <div class="chunk-card">
+                        <div class="chunk-title">📘 {pdf} — Page {page}</div>
+                        <div>{chunk[:300]}...</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-        answer = generate_final_answer(user_query, context)
-        hindi = translator.translate_to_hindi(answer)
-        kannada = translator.translate_to_kannada(answer)
+            with st.spinner("💬 Generating answer..."):
+                answer = generate_final_answer(user_query, context)
+            st.subheader("💡 Final Answer:")
+            st.markdown(
+                f"""
+                <div class="final-answer">
+                    {answer}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
-        print("\nAnswer (English):\n", answer)
-        print("\nAnswer (Hindi):\n", hindi)
-        print("\nAnswer (Kannada):\n", kannada)
+
+if __name__ == "__main__":
+    main()
